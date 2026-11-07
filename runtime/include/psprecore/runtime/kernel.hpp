@@ -63,6 +63,7 @@ struct Thread {
     int wakeup_requests = 0;
     std::uint32_t exit_status = 0;
     bool delete_on_exit = false;  // ExitDeleteThread / loader-owned module_start thread
+    bool kill_requested = false;  // TerminateDeleteThread: unwind the host thread at the next wait point
     std::uint64_t ready_order = 0;  // FIFO position among equal priorities
 
     nx::semaphore baton{0};  // released when the scheduler hands this thread the guest CPU
@@ -131,6 +132,7 @@ public:
     std::uint32_t wait(WaitType type, int object, std::uint32_t timeout_addr, bool callbacks, std::uint64_t delay_us = 0);
     void wake(Thread& t, std::uint32_t result);
     void yield_to_higher_priority();  // preempt the current thread if a better one became ready
+    void schedule_from(Thread* from);  // hand the baton to the best ready thread (or the idle loop)
     void rotate_ready_queue();        // yield to equal-priority threads
     nx::vector<Thread*> waiters(WaitType type, int object);
 
@@ -168,7 +170,6 @@ public:
     std::int64_t behind_us() const { return behind_us_.load(std::memory_order_relaxed); }
 
 private:
-    void schedule_from(Thread* from);  // hand the baton to the best ready thread (or the idle loop)
     Thread* best_ready() const;
     void make_ready(Thread& t);
     void host_thread_main(Thread* t);

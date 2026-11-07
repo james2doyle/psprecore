@@ -209,6 +209,7 @@ void Kernel::schedule_from(Thread* from) {
 std::uint32_t Kernel::wait(WaitType type, int object, std::uint32_t timeout_addr, bool callbacks, std::uint64_t delay_us) {
     Thread& t = current();
     if (!tl_current) return 0;  // cannot block in interrupt context
+    if (t.kill_requested) throw ThreadExit{};  // terminated while running (no park point reached)
     if (callbacks) check_callbacks();
     t.state = Thread::State::Waiting;
     t.wait = type;
@@ -218,6 +219,7 @@ std::uint32_t Kernel::wait(WaitType type, int object, std::uint32_t timeout_addr
     t.wake_time = delay_us ? now_us_ + delay_us : timeout_addr ? now_us_ + memory_.read32(timeout_addr) : 0;
     t.wait_result = 0;
     schedule_from(&t);
+    if (t.kill_requested) throw ThreadExit{};  // terminated while parked (woken to die)
     if (callbacks) check_callbacks();
     return t.wait_result;
 }

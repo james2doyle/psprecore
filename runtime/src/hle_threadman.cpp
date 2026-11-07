@@ -24,6 +24,37 @@ void ExitThread(Context& c) { kernel().exit_current_thread(arg(c, 0), false); }
 void ExitDeleteThread(Context& c) { kernel().exit_current_thread(arg(c, 0), true); }
 void DeleteThread(Context& c) { ret(c, kernel().delete_thread(static_cast<int>(arg(c, 0)))); }
 void GetThreadId(Context& c) { ret(c, static_cast<std::uint32_t>(kernel().current_id())); }
+// Non-blocking: the exit status once the thread is done (games poll this after WaitThreadEnd).
+void GetThreadExitStatus(Context& c) {
+    Thread* t = kernel().thread(static_cast<int>(arg(c, 0)));
+    if (!t) return ret(c, kErrorUnknownThread);
+    if (t->state != Thread::State::Dead && t->state != Thread::State::Dormant) return ret(c, t->exit_status);
+    ret(c, t->exit_status);
+}
+// Stops the thread and frees it; terminating a live thread it does not own just wakes it with an error.
+void TerminateDeleteThread(Context& c) {
+    Kernel& k = kernel();
+    const int id = static_cast<int>(arg(c, 0));
+    Thread* t = k.thread(id);
+    if (!t) return ret(c, kErrorUnknownThread);
+    if (t == &k.current()) k.exit_current_thread(0, true);
+    if (t->state != Thread::State::Dead && t->state != Thread::State::Dormant) {
+        // A live host thread may be parked in a wait; flag it and hand it the CPU so it unwinds
+        // (wait() throws) instead of hanging delete_thread's join forever. The parked-target case
+        // resolves on this handoff; a target that never waits cannot be preempted here.
+        t->kill_requested = true;
+        if (t->state == Thread::State::Waiting) k.wake(*t, 0);
+        if (t->state != Thread::State::Dead) {
+            Thread& cur = k.current();
+            cur.state = Thread::State::Ready;
+            k.schedule_from(&cur);  // resumes here once the target dies (or another thread yields back)
+        }
+        for (Thread* w : k.waiters(WaitType::ThreadEnd, t->id)) k.wake(*w, 0);
+        t->state = Thread::State::Dead;
+        t->exit_status = 0;
+    }
+    ret(c, k.delete_thread(id));
+}
 
 void DelayThread(Context& c) {
     kernel().wait(WaitType::Delay, 0, 0, false, std::max<std::uint32_t>(arg(c, 0), 1));
@@ -203,8 +234,25 @@ void ClearEventFlag(Context& c) {
     f->bits &= arg(c, 1);
     ret(c, 0);
 }
+// sceKernelReferEventFlagStatus(id, SceKernelEventFlagInfo*): size, name, attr, patterns, waiter count.
+void ReferEventFlagStatus(Context& c) {
+    EventFlag* f = event_flag(arg(c, 0));
+    if (!f) return ret(c, kErrorUnknownEventFlag);
+    const std::uint32_t info = arg(c, 1);
+    if (info && mem().read32(info) >= 4 + 32 + 4 + 4 + 4 + 4) {
+        char name[32] = {};
+        std::memcpy(name, f->name.c_str(), std::min<std::size_t>(f->name.size(), 31));
+        mem().write32(info + 0, 4 + 32 + 4 + 4 + 4 + 4);
+        std::memcpy(mem().ptr(info + 4), name, 32);
+        mem().write32(info + 36, f->attr);
+        mem().write32(info + 40, 0);  // initPattern (not tracked; current value below matters)
+        mem().write32(info + 44, f->bits);
+        mem().write32(info + 48, static_cast<std::uint32_t>(kernel().waiters(WaitType::EventFlag, f->id).size()));
+    }
+    ret(c, 0);
+}
 
-void WaitEventFlag(Context& c) {
+void wait_event_flag(Context& c, bool callbacks) {
     Kernel& k = kernel();
     EventFlag* f = event_flag(arg(c, 0));
     if (!f) return ret(c, kErrorUnknownEventFlag);
@@ -214,8 +262,10 @@ void WaitEventFlag(Context& c) {
     t.wait_value = pattern;
     t.wait_mode = mode;
     t.wait_out = out;
-    ret(c, k.wait(WaitType::EventFlag, f->id, arg(c, 4), false));
+    ret(c, k.wait(WaitType::EventFlag, f->id, arg(c, 4), callbacks));
 }
+void WaitEventFlag(Context& c) { wait_event_flag(c, false); }
+void WaitEventFlagCB(Context& c) { wait_event_flag(c, true); }
 
 // ---- fixed-size pools --------------------------------------------------------------------------
 
@@ -227,7 +277,14 @@ void CreateFpl(Context& c) {
     p->attr = arg(c, 2);
     p->block_size = (arg(c, 3) + 3) & ~3u;
     const std::uint32_t blocks = arg(c, 4);
-    p->base = k.user_heap().alloc(p->block_size * blocks, 16, (p->attr & 0x4000) != 0);
+    const std::uint32_t opt = arg(c, 5);
+    std::uint32_t align = 16;
+    if (opt) {  // {size>=8, alignment}: FPL opt param selects the block alignment
+        const std::uint32_t opt_size = mem().read32(opt);
+        if (opt_size >= 8) align = mem().read32(opt + 4);
+        if (align < 4 || (align & (align - 1))) align = 16;
+    }
+    p->base = k.user_heap().alloc(p->block_size * blocks, align, (p->attr & 0x4000) != 0);
     if (!p->base) return ret(c, kErrorNoMemory);
     p->used.assign(blocks, false);
     const int id = p->id;
@@ -264,7 +321,25 @@ void GetSystemTimeLow(Context& c) {
     k.advance(1);  // busy loops on the clock must still see time pass
     ret(c, static_cast<std::uint32_t>(k.now()));
 }
+// sceKernelGetSystemTime(SceKernelSystemTime *t): 64-bit microsecond clock.
+void GetSystemTime(Context& c) {
+    Kernel& k = kernel();
+    k.advance(1);
+    const std::uint64_t now = k.now();
+    if (const std::uint32_t out = arg(c, 0)) {
+        mem().write32(out, static_cast<std::uint32_t>(now));
+        mem().write32(out + 4, static_cast<std::uint32_t>(now >> 32));
+    }
+    ret(c, 0);
+}
 void ReferProfiler(Context& c) { ret(c, 0); }
+// Releasing a thread that is not waiting succeeds; a waiting one would resume with its wait error.
+void ReleaseWaitThread(Context& c) {
+    Kernel& k = kernel();
+    if (Thread* t = k.thread(static_cast<int>(arg(c, 0))); t && t->state == Thread::State::Waiting)
+        k.wake(*t, kErrorWaitCancel);
+    ret(c, 0);
+}
 
 // ---- Kernel_Library / InterruptManager ---------------------------------------------------------
 
@@ -290,6 +365,8 @@ constexpr HleBinding kBindings[] = {
     {"sceKernelExitDeleteThread", ExitDeleteThread},
     {"sceKernelDeleteThread", DeleteThread},
     {"sceKernelGetThreadId", GetThreadId},
+    {"sceKernelGetThreadExitStatus", GetThreadExitStatus},
+    {"sceKernelTerminateDeleteThread", TerminateDeleteThread},
     {"sceKernelDelayThread", DelayThread},
     {"sceKernelDelayThreadCB", DelayThreadCB},
     {"sceKernelSleepThread", SleepThread},
@@ -300,17 +377,22 @@ constexpr HleBinding kBindings[] = {
     {"sceKernelDeleteSema", DeleteSema},
     {"sceKernelSignalSema", SignalSema},
     {"sceKernelWaitSema", WaitSema},
+    {"sceKernelWaitSemaCB", [](Context& c) { wait_sema(c, true); }},
+    {"sceKernelReleaseWaitThread", ReleaseWaitThread},
     {"sceKernelCancelSema", CancelSema},
     {"sceKernelCreateEventFlag", CreateEventFlag},
     {"sceKernelDeleteEventFlag", DeleteEventFlag},
     {"sceKernelSetEventFlag", SetEventFlag},
     {"sceKernelClearEventFlag", ClearEventFlag},
+    {"sceKernelReferEventFlagStatus", ReferEventFlagStatus},
     {"sceKernelWaitEventFlag", WaitEventFlag},
+    {"sceKernelWaitEventFlagCB", WaitEventFlagCB},
     {"sceKernelCreateFpl", CreateFpl},
     {"sceKernelAllocateFpl", AllocateFpl},
     {"sceKernelCreateCallback", CreateCallback},
     {"sceKernelDeleteCallback", DeleteCallback},
     {"sceKernelGetSystemTimeLow", GetSystemTimeLow},
+    {"sceKernelGetSystemTime", GetSystemTime},
     {"sceKernelReferThreadProfiler", ReferProfiler},
     {"sceKernelReferGlobalProfiler", ReferProfiler},
     {"sceKernelCpuSuspendIntr", CpuSuspendIntr},
