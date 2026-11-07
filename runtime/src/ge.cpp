@@ -261,6 +261,167 @@ std::uint64_t now_ns() {
 
 }  // namespace
 
+void Processor::patch(std::uint32_t p, bool bezier) {
+    const int u_count = static_cast<int>(p & 0xFF);
+    const int v_count = static_cast<int>((p >> 8) & 0xFF);
+    if (u_count <= 0 || v_count <= 0 || u_count > 16 || v_count > 16) {
+        if (!warned_patches_) std::fprintf(stderr, "GE: patch %dx%d out of range, skipping\n", u_count, v_count);
+        warned_patches_ = true;
+        return;
+    }
+    if (!bezier) {  // B-spline patches are not implemented; keep the old warning.
+        if (!warned_patches_) std::fprintf(stderr, "GE: spline patches are not rendered yet\n");
+        warned_patches_ = true;
+        // Still consume the control points so the stream stays in sync.
+        state_.format = VertexFormat::decode(state_.param(VERTEXTYPE));
+        const int stride = state_.format.stride();
+        if (state_.format.index_size())
+            iaddr_ += static_cast<std::uint32_t>(u_count * v_count * state_.format.index_size());
+        else
+            vaddr_ += static_cast<std::uint32_t>(u_count * v_count * stride);
+        return;
+    }
+    const std::uint32_t div = state_.param(PATCHDIVISION);
+    int s_div = static_cast<int>(div & 0xFF);
+    int t_div = static_cast<int>((div >> 8) & 0xFF);
+    s_div = std::clamp(s_div, 1, 64);
+    t_div = std::clamp(t_div, 1, 64);
+    const std::uint32_t patch_prim = state_.param(PATCHPRIMITIVE) & 7;
+    if (patch_prim != 0) {
+        // Only triangle output is implemented so far; still render as triangles.
+        if (!warned_patch_prim_) {
+            std::fprintf(stderr, "GE: patch primitive %u treated as triangles\n", patch_prim);
+            warned_patch_prim_ = true;
+        }
+    }
+
+    state_.format = VertexFormat::decode(state_.param(VERTEXTYPE));
+    state_.vertex_address = vaddr_;
+    const VertexFormat& f = state_.format;
+    float morph_weights[8];
+    for (int i = 0; i < 8; ++i) morph_weights[i] = state_.flt(static_cast<std::uint8_t>(MORPHWEIGHT0 + i));
+    const int index_size = f.index_size();
+    const DecodeFn decode = select_decoder(f);
+    const auto in_vram = [](std::uint32_t a) { return (vram_canonical(a) & 0x0F000000) == 0x04000000; };
+    if (in_vram(vaddr_) || (index_size && in_vram(iaddr_))) flush();
+    const std::uint64_t decode_start = now_ns();
+    nx::vector<Vertex> ctrl(static_cast<std::size_t>(u_count * v_count));
+    for (int i = 0; i < u_count * v_count; ++i) {
+        std::uint32_t n = static_cast<std::uint32_t>(i);
+        if (index_size == 1) n = *memory_.ptr(iaddr_ + static_cast<std::uint32_t>(i));
+        else if (index_size == 2) {
+            std::uint16_t x;
+            std::memcpy(&x, memory_.ptr(iaddr_ + static_cast<std::uint32_t>(i) * 2), 2);
+            n = x;
+        } else if (index_size == 4) n = memory_.read32(iaddr_ + static_cast<std::uint32_t>(i) * 4);
+        decode(f, memory_.ptr(vram_canonical(vaddr_ + n * static_cast<std::uint32_t>(f.stride()))), morph_weights,
+               ctrl[static_cast<std::size_t>(i)]);
+    }
+    if (index_size)
+        iaddr_ += static_cast<std::uint32_t>(u_count * v_count * index_size);
+    else
+        vaddr_ += static_cast<std::uint32_t>(u_count * v_count * f.stride());
+
+    // Bernstein basis for degree n = count - 1.
+    auto bernstein = [](int n, float t, float* out) {
+        float inv = 1.0f - t;
+        // Binomial coefficients via Pascal's triangle (n <= 15).
+        float c = 1.0f;
+        for (int i = 0; i <= n; ++i) {
+            if (i > 0) c = c * static_cast<float>(n - i + 1) / static_cast<float>(i);
+            float p = 1.0f;
+            for (int k = 0; k < i; ++k) p *= t;
+            for (int k = 0; k < n - i; ++k) p *= inv;
+            out[i] = c * p;
+        }
+        if (n == 0) out[0] = 1.0f;
+    };
+    // Bernstein weights depend on one parameter each: tabulate them once per division line.
+    nx::vector<float> bu_table(static_cast<std::size_t>((s_div + 1) * u_count));
+    for (int is = 0; is <= s_div; ++is)
+        bernstein(u_count - 1, static_cast<float>(is) / static_cast<float>(s_div),
+                  &bu_table[static_cast<std::size_t>(is) * static_cast<std::size_t>(u_count)]);
+    nx::vector<float> bv_table(static_cast<std::size_t>((t_div + 1) * v_count));
+    for (int it = 0; it <= t_div; ++it)
+        bernstein(v_count - 1, static_cast<float>(it) / static_cast<float>(t_div),
+                  &bv_table[static_cast<std::size_t>(it) * static_cast<std::size_t>(v_count)]);
+    // Patch UVs are the (u, v) parameters; the pipeline applies TEXSCALE/OFFSET afterwards (3D patches
+    // sample the texture normally, through-mode patches address texels directly).
+    float tex_w = 1.0f, tex_h = 1.0f;
+    if (f.through) {
+        const std::uint32_t sz = state_.param(ge::TEXSIZE0);
+        tex_w = static_cast<float>(1 << std::min<std::uint32_t>(sz & 15, 10));
+        tex_h = static_cast<float>(1 << std::min<std::uint32_t>((sz >> 8) & 15, 10));
+    }
+    nx::vector<Vertex> grid(static_cast<std::size_t>((s_div + 1) * (t_div + 1)));
+    for (int it = 0; it <= t_div; ++it) {
+        const float v = static_cast<float>(it) / static_cast<float>(t_div);
+        const float* bvr = &bv_table[static_cast<std::size_t>(it) * static_cast<std::size_t>(v_count)];
+        for (int is = 0; is <= s_div; ++is) {
+            const float u = static_cast<float>(is) / static_cast<float>(s_div);
+            const float* bur = &bu_table[static_cast<std::size_t>(is) * static_cast<std::size_t>(u_count)];
+            Vertex vert{};
+            vert.color[0] = -1.0f;
+            bool has_color = f.color >= 4;
+            float col[4] = {0, 0, 0, 0};
+            for (int j = 0; j < v_count; ++j) {
+                for (int i = 0; i < u_count; ++i) {
+                    const float w = bur[i] * bvr[static_cast<std::size_t>(j)];
+                    const Vertex& c = ctrl[static_cast<std::size_t>(j * u_count + i)];
+                    for (int k = 0; k < 3; ++k) vert.pos[k] += w * c.pos[k];
+                    for (int k = 0; k < 3; ++k) vert.normal[k] += w * c.normal[k];
+                    for (int k = 0; k < f.weights; ++k) vert.weights[k] += w * c.weights[k];
+                    if (has_color)
+                        for (int k = 0; k < 4; ++k) col[k] += w * c.color[k];
+                }
+            }
+            if (has_color)
+                for (int k = 0; k < 4; ++k) vert.color[k] = col[k];
+            else
+                vert.color[0] = -1.0f;
+            if (f.through) {
+                vert.uv[0] = u * tex_w;
+                vert.uv[1] = v * tex_h;
+            } else {
+                vert.uv[0] = u;
+                vert.uv[1] = v;
+            }
+            grid[static_cast<std::size_t>(it * (s_div + 1) + is)] = vert;
+        }
+    }
+    vertices_.clear();
+    vertices_.reserve(static_cast<std::size_t>(s_div * t_div * 6));
+    for (int it = 0; it < t_div; ++it) {
+        for (int is = 0; is < s_div; ++is) {
+            const std::size_t a = static_cast<std::size_t>(it * (s_div + 1) + is);
+            const std::size_t b = a + 1, c = a + static_cast<std::size_t>(s_div + 1), d = c + 1;
+            vertices_.push_back(grid[a]);
+            vertices_.push_back(grid[b]);
+            vertices_.push_back(grid[d]);
+            vertices_.push_back(grid[a]);
+            vertices_.push_back(grid[d]);
+            vertices_.push_back(grid[c]);
+        }
+    }
+    ++stats_.draws;
+    stats_.vertices += static_cast<std::uint64_t>(vertices_.size());
+    if (on_draw) on_draw(Draw{0, static_cast<std::uint32_t>(Prim::Triangles), static_cast<std::uint32_t>(vertices_.size()), f.raw, vaddr_, iaddr_, &state_});
+    const std::uint64_t render_start = now_ns();
+    stats_.decode_ns += render_start - decode_start;
+    if (renderer_ && !vertices_.empty()) {
+        // The tessellator emits a fixed winding, so draw double-sided: with the incoming cull state the
+        // grids can come out back-facing (PATCHFACING handling and hw winding convention are follow-ups).
+        // A patch with no texture bound (address 0) would sample invalid memory: draw it untextured.
+        State draw_state = state_;
+        draw_state.regs[ge::CULLFACEENABLE] = 0;
+        const std::uint32_t texaddr =
+            ((draw_state.param(ge::TEXBUFWIDTH0) & 0x0F0000) << 8) | (draw_state.param(ge::TEXADDR0) & 0xFFFFF0);
+        if ((texaddr & 0xFFFFF0) == 0) draw_state.regs[ge::TEXTUREMAPENABLE] = 0;
+        renderer_->draw(draw_state, Prim::Triangles, vertices_);
+        stats_.render_ns += now_ns() - render_start;
+    }
+}
+
 void Processor::draw(std::uint32_t p) {
     const auto prim = static_cast<Prim>((p >> 16) & 7);
     const std::uint32_t count = p & 0xFFFF;
@@ -409,11 +570,8 @@ void Processor::run(List& l) {
                 }
                 return;
             case PRIM: draw(p); break;
-            case BEZIER:
-            case SPLINE:
-                if (!warned_patches_) std::fprintf(stderr, "GE: bezier/spline patches are not rendered yet\n");
-                warned_patches_ = true;
-                break;
+            case BEZIER: patch(p, true); break;
+            case SPLINE: patch(p, false); break;
             case BOUNDINGBOX: bbox_visible_ = true; break;  // conservative: always "maybe visible"
             case BJUMP:
                 if (!bbox_visible_) l.pc = address(p & ~3u);

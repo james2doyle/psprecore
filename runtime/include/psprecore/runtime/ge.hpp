@@ -178,6 +178,7 @@ private:
     };
     void run(List& list);
     void draw(std::uint32_t param);
+    void patch(std::uint32_t param, bool bezier);
     std::uint32_t address(std::uint32_t param) const { return ((base_ | param) + offset_) & 0x0FFFFFFF; }
 
     GuestMemory& memory_;
@@ -188,6 +189,7 @@ private:
     std::uint32_t world_index_ = 0, view_index_ = 0, proj_index_ = 0, tgen_index_ = 0, bone_index_ = 0;
     bool bbox_visible_ = true;
     bool warned_patches_ = false;
+    bool warned_patch_prim_ = false;  // non-triangle PATCHPRIMITIVE already reported
     std::uint32_t warned_signals_ = 0;  // bit per unsupported signal behaviour already reported
     // Lists stay where they are while running: a signal handler may enqueue more (nx::map moves its elements).
     nx::map<int, nx::unique_ptr<List>> lists_;
