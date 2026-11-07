@@ -11,8 +11,10 @@ add_library(psprecore_runtime STATIC
     src/hle_display.cpp
     src/hle_audio.cpp
     src/hle_mpeg.cpp
+    src/hle_psmf.cpp
     src/hle_atrac.cpp
     src/hle_savedata.cpp
+    src/hle_font.cpp
     src/crash_handler.cpp
     src/vfpu.cpp
     src/ge.cpp

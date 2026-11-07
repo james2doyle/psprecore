@@ -52,16 +52,27 @@ struct Mpeg {
     bool skipping = false;               // skip_movie: fast-forward to the end (black frames, silence)
     bool decoding = false;               // a frame was decoded since the video stream was registered
     std::uint64_t last_decode_vblank = 0;
+    std::uint64_t stream_size = 0;        // PSMF payload bytes (from the header at QueryStreamOffset)
+    std::uint64_t fed_bytes = 0;         // payload bytes handed to the demux so far
+    std::uint64_t last_pts[2] = {};      // last access unit timestamp per stream
     psmf::Demuxer demux;
     bool registered[2] = {};
     int next_stream_id = 1;
     int stream_type[16] = {};
     std::uint32_t pixel_mode = 3;
+    // Last vblank each stream's access units were pulled (GetAvcAu/GetAtracAu success).
+    // A registered stream the game stops draining must not pin the ringbuffer forever
+    // (this game's boot ident pulls one audio unit, then video only): streams idle for
+    // more than a couple of seconds are ignored when freeing packets.
+    std::uint64_t last_get[2] = {};
+    // YCbCr direct-to-VRAM path (sceMpegAvcInitYCbCr / DecodeStopYCbCr / AvcCsc), used for cutscenes.
+    std::uint32_t ycbcr_mode = 0, ycbcr_width = 0, ycbcr_height = 0, ycbcr_buffer = 0;
     // Cooked media for the current movie (psprecore/formats/cooked.hpp).
     nx::unique_ptr<media::Av1Video> video;
     nx::unique_ptr<audio::VorbisStream> audio;
     nx::vector<std::uint32_t> frame;
     int frame_width = 0;
+    bool have_frame = false;  // the last next_frame() produced a real picture (else outputs stay black)
     std::uint64_t audio_base = 0;
     bool have_audio_base = false;
 } g_mpeg;
@@ -80,11 +91,13 @@ void sync_ring() {
     mem().write32(r + kPacketsFree, packets - static_cast<std::uint32_t>(g_mpeg.written - g_mpeg.freed));
 }
 
-// Frees packets every registered stream has moved past.
+// Frees packets every stream being drained has moved past (idle streams do not pin the buffer).
 void release_packets() {
     std::uint64_t keep = g_mpeg.written;
+    const std::uint64_t now = kernel().vblank_count();
     for (int s = 0; s < 2; ++s) {
         if (!g_mpeg.registered[s]) continue;
+        if (g_mpeg.last_get[s] && now - g_mpeg.last_get[s] > 120) continue;  // idle: ignore
         const auto stream = static_cast<psmf::Stream>(s);
         const auto& units = g_mpeg.demux.units(stream);
         std::uint64_t pack = 0;
@@ -185,6 +198,12 @@ void RingbufferPut(Context& c) {
         if (n < chunk) break;
     }
     sync_ring();
+    g_mpeg.fed_bytes += static_cast<std::uint64_t>(added) * kPacketSize;
+    if (!g_mpeg.eof && g_mpeg.stream_size && g_mpeg.fed_bytes >= g_mpeg.stream_size) {
+        g_mpeg.eof = true;  // the whole stream is in; the demux drains, then the movie is over
+        std::fprintf(stderr, "sceMpeg: end of stream at vblank %llu\n",
+                     static_cast<unsigned long long>(kernel().vblank_count()));
+    }
     ret(c, added);
 }
 
@@ -213,6 +232,9 @@ void QueryStreamOffset(Context& c) {
     g_mpeg.key = key;
     g_mpeg.skipping = false;
     g_mpeg.decoding = false;
+    g_mpeg.stream_size = header.data_size;
+    g_mpeg.fed_bytes = 0;
+    g_mpeg.last_pts[0] = g_mpeg.last_pts[1] = 0;
     std::fprintf(stderr, "sceMpeg: movie %016llX at vblank %llu\n", static_cast<unsigned long long>(key),
                  static_cast<unsigned long long>(kernel().vblank_count()));
     if (!g_mpeg.video)
@@ -266,10 +288,19 @@ void InitAu(Context& c) {
 void get_au(Context& c, int stream) {
     AccessUnit u;
     if (!next_unit(stream, u)) {
+        if (g_mpeg.eof) {  // drained to the end (PPSSPP: pts kept, dts -1, NO_DATA)
+            mem().write32(arg(c, 2), static_cast<std::uint32_t>(g_mpeg.last_pts[stream] >> 32));
+            mem().write32(arg(c, 2) + 4, static_cast<std::uint32_t>(g_mpeg.last_pts[stream]));
+            mem().write32(arg(c, 2) + 8, 0xFFFFFFFF);
+            mem().write32(arg(c, 2) + 12, 0xFFFFFFFF);
+            mem().write32(arg(c, 2) + 20, 0);
+        }
         ret(c, kErrorNoData);
         return;
     }
     write_au(arg(c, 2), u);
+    g_mpeg.last_pts[stream] = u.pts;
+    g_mpeg.last_get[stream] = kernel().vblank_count();
     if (arg(c, 3)) mem().write32(arg(c, 3), stream == kAvc ? 1 : 0);
     release_packets();
     ret(c, 0);
@@ -284,19 +315,120 @@ void AvcDecodeMode(Context& c) {
     ret(c, 0);
 }
 
+// Advances the cooked movie one picture (shared by the RGB and YCbCr decode paths).
+// True when a real picture is available; otherwise the caller draws black.
+bool next_frame() {
+    g_mpeg.decoding = true;
+    g_mpeg.last_decode_vblank = kernel().vblank_count();
+    g_mpeg.have_frame = false;
+    if (!g_mpeg.skipping && g_mpeg.video && g_mpeg.video->next(g_mpeg.frame)) {
+        g_mpeg.frame_width = g_mpeg.video->width();
+        g_mpeg.have_frame = !g_mpeg.frame.empty() && g_mpeg.frame_width > 0;
+    }
+    return g_mpeg.have_frame;
+}
+
+// BT.601 full-range RGBA -> YCbCr planar 4:2:0 (the inverse of Av1Video's convert,
+// so AvcCsc below reproduces the cooked picture).
+void rgba_to_ycbcr(const nx::vector<std::uint32_t>& rgba, int w, int h, std::uint8_t* y, std::uint8_t* u,
+                   std::uint8_t* v, int stride) {
+    for (int j = 0; j < h; ++j) {
+        for (int i = 0; i < w; ++i) {
+            const std::uint32_t p = rgba[static_cast<std::size_t>(j) * static_cast<std::size_t>(w) + i];
+            const int r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
+            y[j * stride + i] = static_cast<std::uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
+        }
+    }
+    for (int j = 0; j < h / 2; ++j) {
+        for (int i = 0; i < w / 2; ++i) {
+            int r = 0, g = 0, b = 0;
+            for (int dj = 0; dj < 2; ++dj)
+                for (int di = 0; di < 2; ++di) {
+                    const std::uint32_t p =
+                        rgba[static_cast<std::size_t>(2 * j + dj) * static_cast<std::size_t>(w) + (2 * i + di)];
+                    r += p & 0xFF;
+                    g += (p >> 8) & 0xFF;
+                    b += (p >> 16) & 0xFF;
+                }
+            r /= 4;
+            g /= 4;
+            b /= 4;
+            u[j * (stride / 2) + i] = static_cast<std::uint8_t>((-43 * r - 84 * g + 127 * b) / 256 + 128);
+            v[j * (stride / 2) + i] = static_cast<std::uint8_t>((127 * r - 106 * g - 21 * b) / 256 + 128);
+        }
+    }
+}
+
+void write_ycbcr(std::uint32_t buffer, int fw, int fh, const nx::vector<std::uint32_t>& frame, int w) {
+    std::uint8_t* base = mem().ptr(buffer);
+    rgba_to_ycbcr(frame, w, 272, base, base + fw * fh, base + fw * fh + (fw / 2) * (fh / 2), fw);
+}
+
+// True black in planar 4:2:0 (Y=0, neutral chroma); plain zeros would convert to dark green.
+void fill_black_ycbcr(std::uint32_t buffer, int fw, int fh) {
+    mem().fill(buffer, 0, static_cast<std::uint32_t>(fw * fh));
+    std::memset(mem().ptr(buffer + fw * fh), 128, static_cast<std::size_t>(fw * fh / 2));
+}
+
+// BT.601 full-range YCbCr planar 4:2:0 -> RGBA8888 (mirrors Av1Video's convert).
+// range* is {x, y, width, height}: only that rectangle is converted (PPSSPP).
+void AvcCsc(Context& c) {
+    const std::uint32_t source = arg(c, 1), range = arg(c, 2), frame_width = arg(c, 3), dest = arg(c, 4);
+    if (!dest) {
+        static int zerodst = 0;
+        if (++zerodst <= 3 || zerodst % 50 == 0)
+            std::fprintf(stderr, "sceMpeg: AvcCsc dest=0 (vblank %llu) #%d\n",
+                         (unsigned long long)kernel().vblank_count(), zerodst);
+    }
+    if (!source || !dest || !range || !mem().valid(range, 16)) return ret(c, 0xFFFFFFFF);
+    const std::uint32_t fw = frame_width ? frame_width : 480;
+    constexpr int kFh = 272;
+    // Source YCbCr is packed at the InitYCbCr width; dest uses frameWidth as its stride (PPSSPP).
+    const int sfw = g_mpeg.ycbcr_width ? static_cast<int>(g_mpeg.ycbcr_width) : 480;
+    int x = static_cast<int>(mem().read32(range)), y = static_cast<int>(mem().read32(range + 4));
+    int w = static_cast<int>(mem().read32(range + 8)), h = static_cast<int>(mem().read32(range + 12));
+    x = std::clamp(x, 0, 480);
+    y = std::clamp(y, 0, 272);
+    w = std::clamp(w, 0, 480 - x);
+    h = std::clamp(h, 0, 272 - y);
+    if (!mem().valid(dest, fw * kFh * 4) || !mem().valid(source, static_cast<std::uint32_t>(sfw * kFh * 3 / 2)))
+        return ret(c, 0xFFFFFFFF);
+    mark_guest_written(dest, fw * kFh * 4);
+    std::uint8_t* row = mem().ptr(dest);
+    if (!g_mpeg.have_frame) {
+        constexpr std::uint32_t kBlack = 0xFF000000u;
+        for (int j = y; j < y + h; ++j)
+            for (int i = x; i < x + w; ++i)
+                std::memcpy(row + (j * fw + i) * 4, &kBlack, 4);
+    } else {
+        const std::uint8_t* yp = mem().ptr(source);
+        const std::uint8_t* up = yp + sfw * kFh, * vp = up + (sfw / 2) * (kFh / 2);
+        for (int j = y; j < y + h; ++j) {
+            std::uint32_t* out = reinterpret_cast<std::uint32_t*>(row + j * fw * 4);
+            for (int i = x; i < x + w; ++i) {
+                const int yy = yp[j * sfw + i];
+                const int uu = up[(j / 2) * (sfw / 2) + (i / 2)] - 128;
+                const int vv = vp[(j / 2) * (sfw / 2) + (i / 2)] - 128;
+                const int r = std::clamp((yy * 65536 + 91881 * vv + 32768) >> 16, 0, 255);
+                const int g = std::clamp((yy * 65536 + 32768 - 22554 * uu - 46802 * vv) >> 16, 0, 255);
+                const int b = std::clamp((yy * 65536 + 116130 * uu + 32768) >> 16, 0, 255);
+                out[i] = static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) |
+                         (static_cast<std::uint32_t>(b) << 16) | 0xFF000000u;
+            }
+        }
+    }
+    ret(c, 0);
+}
+
 // sceMpegAvcDecode(mpeg, au, frame_width, buffer*, init*): the next frame of the cooked movie, in display order
 // (black without cooked media). Writes 480x272 pixels in the pixel mode chosen by sceMpegAvcDecodeMode.
 void AvcDecode(Context& c) {
-    g_mpeg.decoding = true;
-    g_mpeg.last_decode_vblank = kernel().vblank_count();
+    const bool have = next_frame();
     const std::uint32_t width = arg(c, 2), buffer = arg(c, 3) ? mem().read32(arg(c, 3)) : 0;
-    if (!g_mpeg.skipping && g_mpeg.video && g_mpeg.video->next(g_mpeg.frame))
-        g_mpeg.frame_width = g_mpeg.video->width();
     if (buffer && width) {
         const std::uint32_t bpp = g_mpeg.pixel_mode == 3 ? 4 : 2;
         mark_guest_written(buffer, width * 272 * bpp);  // the decoded frame lands in the game's buffer
         const int fw = g_mpeg.frame_width;
-        const bool have = !g_mpeg.frame.empty() && fw > 0;
         constexpr std::uint32_t kBlack = 0xFF000000u;
         const std::uint16_t black16 = g_mpeg.pixel_mode == 1 ? 0x8000 : g_mpeg.pixel_mode == 2 ? 0xF000 : 0;
         for (std::uint32_t y = 0; y < 272; ++y) {
@@ -331,6 +463,80 @@ void AvcDecode(Context& c) {
     ret(c, 0);
 }
 void AvcDecodeFlush(Context& c) { ret(c, 0); }
+
+// sceMpegQueryStreamSize(header_buffer, size*, width*, height*): memory and picture size for the PSMF.
+// sceMpegQueryStreamSize(header_buffer, size*): the PSMF stream size (PPSSPP takes only these two
+// arguments; anything else in the registers is not an output).
+void QueryStreamSize(Context& c) {
+    psmf::Header header;
+    if (!psmf::parse_header({reinterpret_cast<const std::byte*>(mem().ptr(arg(c, 0))), psmf::kPackSize}, header)) {
+        if (arg(c, 1) && mem().valid(arg(c, 1), 4)) mem().write32(arg(c, 1), 0);
+        return ret(c, 0x80610002);  // invalid value
+    }
+    if (arg(c, 1)) mem().write32(arg(c, 1), header.data_size);
+    ret(c, 0);
+}
+
+// sceMpegAvcQueryYCbCrSize(mpeg, mode, width, height, size*): planar 4:2:0 buffer size.
+void AvcQueryYCbCrSize(Context& c) {
+    const std::uint32_t width = arg(c, 2), height = arg(c, 3);
+    if (!width || !height || (width & 15) || (height & 15) || width > 480 || height > 272)
+        return ret(c, 0x80610002);
+    if (arg(c, 4)) mem().write32(arg(c, 4), (width / 2) * (height / 2) * 6 + 128);
+    ret(c, 0);
+}
+
+// sceMpegAvcInitYCbCr(mpeg, mode, width, height, buffer): the game's YCbCr target for DecodeStopYCbCr.
+void AvcInitYCbCr(Context& c) {
+    g_mpeg.ycbcr_mode = arg(c, 1);
+    g_mpeg.ycbcr_width = arg(c, 2);
+    g_mpeg.ycbcr_height = arg(c, 3);
+    g_mpeg.ycbcr_buffer = arg(c, 4);
+    ret(c, 0);
+}
+
+// sceMpegAvcDecodeYCbCr(mpeg, au, buffer, init*): the next cooked picture as YCbCr planar 4:2:0
+// (black without cooked media). Dimensions come from sceMpegAvcInitYCbCr; init is flagged complete.
+void AvcDecodeYCbCr(Context& c) {
+    const bool have = next_frame();
+    // PPSSPP: bufferAddr points at the game's buffer pointer.
+    const std::uint32_t buffer =
+        (arg(c, 2) && mem().valid(arg(c, 2), 4)) ? mem().read32(arg(c, 2)) : arg(c, 2);
+    const int fw = g_mpeg.ycbcr_width ? static_cast<int>(g_mpeg.ycbcr_width) : 480;
+    const int fh = g_mpeg.ycbcr_height ? static_cast<int>(g_mpeg.ycbcr_height) : 272;
+    if (buffer && fw > 0 && fh > 0 && mem().valid(buffer, static_cast<std::uint32_t>(fw * fh * 3 / 2))) {
+        mark_guest_written(buffer, static_cast<std::uint32_t>(fw * fh * 3 / 2));
+        if (have && g_mpeg.frame_width >= fw)
+            write_ycbcr(buffer, fw, fh, g_mpeg.frame, g_mpeg.frame_width);
+        else
+            fill_black_ycbcr(buffer, fw, fh);
+    }
+    if (arg(c, 3) && mem().valid(arg(c, 3), 4)) mem().write32(arg(c, 3), 1);
+    ret(c, 0);
+}
+
+// sceMpegAvcDecodeStopYCbCr(mpeg, buffer, status*): the next cooked picture as YCbCr planar 4:2:0
+// (black without cooked media). Dimensions come from sceMpegAvcInitYCbCr; the status word is signaled
+// on completion (PPSSPP's stub writes 0, but the game polls it, so a synchronous decode reports 1).
+// Like AvcDecodeYCbCr, the game passes the address of its buffer-pointer slot: the real target is the
+// pointer stored there (writing the frame to the slot itself would corrupt the movie struct).
+void AvcDecodeStopYCbCr(Context& c) {
+    const bool have = next_frame();
+    const std::uint32_t slot = arg(c, 1);
+    const std::uint32_t buffer =
+        slot ? ((mem().valid(slot, 4) && mem().read32(slot)) ? mem().read32(slot) : slot) : g_mpeg.ycbcr_buffer;
+    const int fw = g_mpeg.ycbcr_width ? static_cast<int>(g_mpeg.ycbcr_width) : 480;
+    const int fh = g_mpeg.ycbcr_height ? static_cast<int>(g_mpeg.ycbcr_height) : 272;
+    if (buffer && fw > 0 && fh > 0 && mem().valid(buffer, static_cast<std::uint32_t>(fw * fh * 3 / 2))) {
+        mark_guest_written(buffer, static_cast<std::uint32_t>(fw * fh * 3 / 2));
+        if (have && g_mpeg.frame_width >= fw)
+            write_ycbcr(buffer, fw, fh, g_mpeg.frame, g_mpeg.frame_width);
+        else
+            fill_black_ycbcr(buffer, fw, fh);
+    }
+    if (arg(c, 2) && mem().valid(arg(c, 2), 4)) mem().write32(arg(c, 2), 1);
+    ret(c, 0);
+}
 
 // sceMpegAtracDecode(mpeg, au, buffer, init): 2048 stereo samples of the cooked movie audio at the unit's
 // timestamp (silence without cooked media).
@@ -383,6 +589,12 @@ constexpr HleBinding kBindings[] = {
     {"sceMpegAvcDecodeMode", AvcDecodeMode},
     {"sceMpegAvcDecode", AvcDecode},
     {"sceMpegAvcDecodeFlush", AvcDecodeFlush},
+    {"sceMpegAvcDecodeYCbCr", AvcDecodeYCbCr},
+    {"sceMpegQueryStreamSize", QueryStreamSize},
+    {"sceMpegAvcQueryYCbCrSize", AvcQueryYCbCrSize},
+    {"sceMpegAvcInitYCbCr", AvcInitYCbCr},
+    {"sceMpegAvcDecodeStopYCbCr", AvcDecodeStopYCbCr},
+    {"sceMpegAvcCsc", AvcCsc},
     {"sceMpegAtracDecode", AtracDecode},
 };
 
