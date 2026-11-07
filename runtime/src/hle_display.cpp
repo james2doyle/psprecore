@@ -149,9 +149,18 @@ void GetFrameBuf(Context& c) {
     if (arg(c, 2)) mem().write32(arg(c, 2), g_display.format);
     ret(c, 0);
 }
+void GetVcount(Context& c) { ret(c, static_cast<std::uint32_t>(kernel().vblank_count())); }
 void WaitVblankStartCB(Context& c) {
     kernel().wait(WaitType::Vblank, 0, 0, true);
     ret(c, 0);
+}
+void WaitVblankCB(Context& c) {  // same wait; the callback variant matters only for callback delivery
+    kernel().wait(WaitType::Vblank, 0, 0, true);
+    ret(c, 0);
+}
+void GetFramePerSec(Context& c) {
+    float f = 59.94f;
+    std::memcpy(&c.fu[0], &f, 4);
 }
 
 // ---- sceGe_user --------------------------------------------------------------------------------
@@ -217,6 +226,9 @@ constexpr HleBinding kBindings[] = {
     {"sceDisplaySetFrameBuf", SetFrameBuf},
     {"sceDisplayGetFrameBuf", GetFrameBuf},
     {"sceDisplayWaitVblankStartCB", WaitVblankStartCB},
+    {"sceDisplayWaitVblankCB", WaitVblankCB},
+    {"sceDisplayGetFramePerSec", GetFramePerSec},
+    {"sceDisplayGetVcount", GetVcount},
     {"sceGeEdramGetAddr", EdramGetAddr},
     {"sceGeListEnQueue", ListEnQueue},
     {"sceGeListEnQueueHead", ListEnQueue},
