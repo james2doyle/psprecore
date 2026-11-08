@@ -23,6 +23,18 @@ public:
     std::uint32_t text_begin() const { return text_begin_; }
     std::uint32_t text_end() const { return text_end_; }
     bool in_text(std::uint32_t addr) const { return addr >= text_begin_ && addr < text_end_; }
+    // PROGBITS sections inside executable segments besides .text (writable code, e.g. init routines in .data).
+    struct CodeSection {
+        std::uint32_t begin = 0, end = 0;  // [begin, end)
+    };
+    const nx::vector<CodeSection>& code_sections() const { return code_sections_; }
+    // .text or any such section: everywhere recompiled code may live.
+    bool in_code(std::uint32_t addr) const {
+        if (in_text(addr)) return true;
+        for (const auto& s : code_sections_)
+            if (addr >= s.begin && addr < s.end) return true;
+        return false;
+    }
 
     std::optional<std::uint32_t> word(std::uint32_t addr) const;  // file-backed memory only
     mips::Instruction insn(std::uint32_t addr) const;
@@ -37,6 +49,7 @@ private:
     prx::Module module_;
     nx::vector<std::byte> image_;  // unrelocated loadable image, BSS zero-filled
     std::uint32_t text_begin_ = 0, text_end_ = 0;
+    nx::vector<CodeSection> code_sections_;
     nx::map<std::uint32_t, std::size_t> reloc_by_addr_;
 };
 
@@ -60,6 +73,9 @@ nx::map<std::uint32_t, JumpTable> find_jump_tables(const Program& program);
 // Every instruction of .text ends up in exactly one function (sorted by start).
 // Jump-table targets are never treated as function starts.
 nx::vector<Function> discover_functions(const Program& program);
+// Sorts by start and assigns ends (next start, else the end of the containing code region). Use after appending
+// manual seeds to discover_functions' output.
+void finalize_functions(const Program& program, nx::vector<Function>& functions);
 
 struct Registration {
     std::uint32_t call_site = 0;  // address of the jal

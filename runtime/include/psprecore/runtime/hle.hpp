@@ -150,6 +150,8 @@ const nx::string& cooked_root();
 void hle_install();
 
 inline std::uint32_t arg(const Context& c, int i) {
+    // First four go in a0-a3, the rest in t0-t3 (this toolchain passes the 5th/6th syscall
+    // argument in t0/t1; PPSSPP's PARAM(n) reads the same registers).
     static constexpr int kRegs[8] = {4, 5, 6, 7, 8, 9, 10, 11};
     return c.r[kRegs[i]];
 }
@@ -166,7 +168,9 @@ void hle_install_io();
 void hle_install_display();
 void hle_install_audio();
 void hle_install_mpeg();
+void hle_install_psmf();
 void hle_install_atrac();
 void hle_install_savedata();
+void hle_install_font();
 
 }  // namespace psprecore::rt

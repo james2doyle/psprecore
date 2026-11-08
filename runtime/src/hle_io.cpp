@@ -44,6 +44,8 @@ struct OpenFile {
     std::uint64_t memory_pos = 0;               // position in `contents` or `memory`
     bool block = false;        // umd0:/umd1:
     std::uint64_t sector = 0;  // block devices: current absolute LBN
+    bool lbn_bound = false;    // disc0:/sce_lbn<LBN>_size<SIZE>: reads/seeks stay in [lbn_start, lbn_start + lbn_size)
+    std::uint64_t lbn_start = 0, lbn_size = 0;  // host offsets of the range
     std::int64_t async_result = 0;
     bool async_pending = false;
     nx::string path;
@@ -62,6 +64,7 @@ nx::map<int, OpenDir> g_dirs;
 nx::string g_mapped_path;  // relative to the disc folder, lower case
 std::uint32_t g_mapped_lbn = 0;
 nx::fs::stream_ptr g_mapped;
+nx::vector<DiscFile> g_disc_files;  // lbn.tsv: every file's start sector (for sce_lbn opens)
 std::unique_ptr<DiscOverlay> g_overlay;
 
 nx::string lower(nx::string s) {
@@ -99,6 +102,14 @@ bool is_block_device(const nx::string& guest) {
     return l == "umd0:" || l == "umd1:" || l == "umd0:/" || l == "umd1:/";
 }
 
+// disc0:/sce_lbn<LBN>_size<SIZE> (lower-cased, no leading slash) -> the sector range, or nullopt.
+std::optional<std::pair<std::uint32_t, std::uint32_t>> parse_lbn(nx::string_view rel) {
+    unsigned lbn = 0, size = 0;
+    if (std::sscanf(nx::string(rel).c_str(), "sce_lbn%x_size%x", &lbn, &size) == 2 && size != 0)
+        return std::make_pair(static_cast<std::uint32_t>(lbn), static_cast<std::uint32_t>(size));
+    return std::nullopt;
+}
+
 std::int64_t block_read(OpenFile& f, std::uint32_t buffer, std::uint32_t sectors) {
     nx::vector<char> data(static_cast<std::size_t>(sectors) * kSector, 0);
     if (f.sector >= g_mapped_lbn && !g_mapped_path.empty()) {
@@ -122,6 +133,12 @@ std::int64_t do_read(int fd, std::uint32_t buffer, std::uint32_t size) {
         f.memory_pos += n;
         return static_cast<std::int64_t>(n);
     }
+    if (!f.in) return -1;
+    if (f.lbn_bound) {
+        const std::uint64_t pos = f.in->tell();
+        const std::uint64_t left = pos < f.lbn_start + f.lbn_size ? f.lbn_start + f.lbn_size - pos : 0;
+        size = static_cast<std::uint32_t>(std::min<std::uint64_t>(size, left));
+    }
     return f.in ? static_cast<std::int64_t>(f.in->read(mem().ptr(buffer), size)) : 0;
 }
 
@@ -141,6 +158,16 @@ std::int64_t do_seek(int fd, std::int64_t offset, int whence) {
         return static_cast<std::int64_t>(f.memory_pos);
     }
     if (!f.in) return -1;
+    if (f.lbn_bound) {
+        // Seeks stay inside the opened range; positions are range-relative, like the PSP reports them.
+        const std::int64_t base = whence == 0 ? static_cast<std::int64_t>(f.lbn_start)
+                                : whence == 1 ? static_cast<std::int64_t>(f.in->tell())
+                                              : static_cast<std::int64_t>(f.lbn_start + f.lbn_size);
+        const std::int64_t pos = std::clamp(base + offset, static_cast<std::int64_t>(f.lbn_start),
+                                            static_cast<std::int64_t>(f.lbn_start + f.lbn_size));
+        f.in->seek(pos, nx::fs::seek_origin::begin);
+        return pos - static_cast<std::int64_t>(f.lbn_start);
+    }
     f.in->seek(offset, whence == 0 ? nx::fs::seek_origin::begin
                        : whence == 1 ? nx::fs::seek_origin::current
                                      : nx::fs::seek_origin::end);
@@ -152,6 +179,32 @@ int do_open(const nx::string& path, std::uint32_t flags) {
     f.path = path;
     if (is_block_device(path)) {
         f.block = true;
+    } else if (const auto lbn = parse_lbn(disc_relative(path))) {
+        // disc0:/sce_lbn<LBN>_size<SIZE>: a sector range served from the extracted file with the exact
+        // same start (a directory extent like SYSDIR/EBOOT.BIN aliases many files; only the exact file's
+        // bytes match what the UMD would return).
+        const DiscFile* cover = nullptr;
+        for (const auto& e : g_disc_files)
+            if (lbn->first == e.lbn && lbn->second <= e.size)
+                cover = &e;
+        if (!cover)
+            for (const auto& e : g_disc_files)
+                if (lbn->first >= e.lbn && lbn->first + lbn->second <= e.lbn + e.size &&
+                    (!cover || e.lbn > cover->lbn))
+                    cover = &e;
+        if (!cover) {
+            std::fprintf(stderr, "sce_lbn: no file covers LBN 0x%x size 0x%x\n", lbn->first, lbn->second);
+            return static_cast<int>(kErrorNotFound);
+        }
+        const nx::string host = path_join(g_game_dir, cover->path);
+        auto in = nx::fs::open_file(host);
+        if (!in.has_value()) return static_cast<int>(kErrorNotFound);
+        const std::uint64_t start = static_cast<std::uint64_t>(lbn->first - cover->lbn) * kSector;
+        if (!in.value()->seek(static_cast<int64_t>(start))) return static_cast<int>(kErrorNotFound);
+        f.in = std::move(in.value());
+        f.lbn_bound = true;
+        f.lbn_start = start;
+        f.lbn_size = lbn->second;
     } else {
         const nx::string host = host_path(path);
         if (host.empty()) return static_cast<int>(kErrorNotFound);
@@ -257,6 +310,14 @@ void WaitAsync(Context& c) {
     if (it->second->async_pending) g_files.erase(it);  // pending close
     ret(c, 0);
 }
+// Our async operations complete inline, so polling always finds the result ready.
+void PollAsync(Context& c) {
+    const int fd = static_cast<int>(arg(c, 0));
+    const auto it = g_files.find(fd);
+    if (it == g_files.end()) return ret(c, kErrorBadFile);
+    if (arg(c, 1)) write64(arg(c, 1), it->second->async_result);
+    ret(c, 0);
+}
 void Write(Context& c) {
     const int fd = static_cast<int>(arg(c, 0));
     const std::uint32_t size = arg(c, 2);
@@ -278,6 +339,15 @@ void Write(Context& c) {
 }
 void Getstat(Context& c) {
     const nx::string path = mem().string(arg(c, 0));
+    if (const auto lbn = parse_lbn(disc_relative(path))) {
+        // The range's size is known without touching the disc; report it like a regular file at its LBN.
+        mem().fill(arg(c, 1), 0, 88);
+        mem().write32(arg(c, 1), 0x21FF);
+        mem().write32(arg(c, 1) + 4, 0x20);
+        write64(arg(c, 1) + 8, static_cast<std::int64_t>(lbn->second));
+        mem().write32(arg(c, 1) + 64, lbn->first);
+        return ret(c, 0);
+    }
     const nx::string host = host_path(path);
     if (host.empty() || !nx::fs::exists(host)) return ret(c, kErrorNotFound);
     write_stat(arg(c, 1), host, !g_mapped_path.empty() && disc_relative(path) == g_mapped_path ? g_mapped_lbn : 0);
@@ -349,6 +419,7 @@ constexpr HleBinding kBindings[] = {
     {"sceIoOpen", Open},           {"sceIoOpenAsync", OpenAsync},     {"sceIoClose", Close},
     {"sceIoCloseAsync", CloseAsync}, {"sceIoRead", Read},             {"sceIoReadAsync", ReadAsync},
     {"sceIoLseek", Lseek},         {"sceIoLseekAsync", LseekAsync},   {"sceIoWaitAsync", WaitAsync},
+    {"sceIoPollAsync", PollAsync},
     {"sceIoWaitAsyncCB", WaitAsync}, {"sceIoWrite", Write},           {"sceIoGetstat", Getstat},
     {"sceIoMkdir", Mkdir},         {"sceIoRename", Rename},           {"sceIoDopen", Dopen},
     {"sceIoDread", Dread},         {"sceIoDclose", Dclose},           {"sceIoDevctl", Devctl},
@@ -382,6 +453,8 @@ void read_disc_sectors(std::uint64_t first, std::uint64_t count, char* out) {
 }
 
 void set_disc_overlay(std::unique_ptr<DiscOverlay> overlay) { g_overlay = std::move(overlay); }
+
+void map_disc_files(nx::vector<DiscFile> files) { g_disc_files = std::move(files); }
 
 const nx::string& game_dir() { return g_game_dir; }
 const nx::string& save_dir() { return g_save_dir; }

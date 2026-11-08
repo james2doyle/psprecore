@@ -20,6 +20,16 @@ void map_disc_file(nx::string_view path, std::uint32_t lbn);
 // Sectors of the mapped file as they are on the disc, `first` relative to its start (for overlays).
 void read_disc_sectors(std::uint64_t first, std::uint64_t count, char* out);
 
+// Files placed on the disc for sce_lbn opens (disc0:/sce_lbn<LBN>_size<SIZE>): the game reads an index file for
+// LBNs and opens sector ranges directly. Served from the extracted files: each entry names the disc-relative
+// file containing LBN `lbn` (the file's own start sector) and its size. Call after set_storage().
+struct DiscFile {
+    std::uint32_t lbn = 0;  // the file's start sector on the disc
+    std::uint32_t size = 0;
+    nx::string path;  // disc-relative, '/' separators (matched case-insensitively)
+};
+void map_disc_files(nx::vector<DiscFile> files);
+
 // What the game reads from the disc, changed (mods): the mapped file's sectors and whole files by name.
 class DiscOverlay {
 public:

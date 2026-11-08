@@ -10,6 +10,12 @@
 #include <jni.h>
 #endif
 #include <SDL3/SDL_vulkan.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+#ifdef JDARC_HAVE_ADRENOTOOLS
+#include <adrenotools/driver.h>
+#endif
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
@@ -149,7 +155,49 @@ struct Display::Impl {
 };
 
 void Display::Impl::create_device() {
-    check(volkInitialize(), "volkInitialize");
+    // A whole Vulkan driver in a file (custom GPU driver packages, e.g. Turnip for Adreno): driven directly
+    // through adrenotools instead of the system's libvulkan.so. The app's GameActivity installs the chosen
+    // package into gpu_drivers/<name>/ (meta.json naming the library) and passes its path in
+    // PSPRECORE_VULKAN_DRIVER; unset: the system driver as usual.
+    bool custom_ready = false;
+    void* custom_module = nullptr;
+    if (const char* custom = std::getenv("PSPRECORE_VULKAN_DRIVER")) {
+#if defined(__ANDROID__) && defined(JDARC_HAVE_ADRENOTOOLS)
+        const std::string path(custom);
+        const std::string::size_type slash = path.rfind('/');
+        if (slash != std::string::npos) {
+            // Hook libraries ship beside libmain.so (jniLibs -> nativeLibraryDir, where adrenotools
+            // expects them); the driver package lives in the app's files dir. libmain.so's own location
+            // (volk is statically linked into it) gives the hooks' directory.
+            Dl_info info{};
+            std::string hooks = ".";
+            if (dladdr(reinterpret_cast<const void*>(&volkInitialize), &info) && info.dli_fname) {
+                hooks = info.dli_fname;
+                if (const auto s = hooks.rfind('/'); s != std::string::npos) hooks.resize(s);
+            }
+            custom_module = adrenotools_open_libvulkan(
+                RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hooks.c_str(),
+                (path.substr(0, slash + 1)).c_str(), path.substr(slash + 1).c_str(), nullptr, nullptr);
+            if (!custom_module) {
+                std::fprintf(stderr, "jdarc: custom Vulkan driver failed to load, using the system one\n");
+            }
+        }
+        if (custom_module) {
+            const auto get_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                dlsym(custom_module, "vkGetInstanceProcAddr"));
+            if (!get_proc) {
+                std::fprintf(stderr, "jdarc: not a Vulkan driver: %s\n", custom);
+            } else {
+                volkInitializeCustom(get_proc);
+                std::fprintf(stderr, "Vulkan driver: %s\n", custom);
+                custom_ready = true;
+            }
+        }
+#else
+        std::fprintf(stderr, "jdarc: custom Vulkan driver ignored (no adrenotools): %s\n", custom);
+#endif
+    }
+    if (!custom_ready) check(volkInitialize(), "volkInitialize");
     Uint32 ext_count = 0;
     const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
     nx::vector<const char*> exts(sdl_exts, sdl_exts + ext_count);
@@ -1024,6 +1072,7 @@ void Display::present(const std::uint32_t* rgba, int width, int height) {
     if (!d.begin_present()) return;
     d.ensure_frame_image(width, height);
     std::memcpy(d.staging_ptr, rgba, static_cast<std::size_t>(width) * height * 4);
+    check(vmaFlushAllocation(d.allocator, d.staging_mem, 0, VK_WHOLE_SIZE), "flush display staging");
     d.blit_and_present(d.frame, 0, 0, width, height, [&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1192,6 +1241,7 @@ std::uint64_t Display::create_texture(const std::uint32_t* rgba, int width, int 
     VmaAllocationInfo info;
     check(vmaCreateBuffer(d.allocator, &bci, &sai, &staging, &staging_mem, &info), "overlay staging buffer");
     std::memcpy(info.pMappedData, rgba, bytes);
+    check(vmaFlushAllocation(d.allocator, staging_mem, 0, bytes), "flush overlay staging");
 
     vkWaitForFences(d.device, 1, &d.fence, VK_TRUE, UINT64_MAX);
     vkResetCommandBuffer(d.cmd, 0);

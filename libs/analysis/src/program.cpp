@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <ranges>
 
 #include "psprecore/error.hpp"
 #include "core/foundation/core/foundation.h"
@@ -64,6 +65,17 @@ Program::Program(const elf::File& file, prx::Module module) : module_(std::move(
     text_end_ = text->addr + text->size;
     for (const auto& s : file.sections())
         if (s.name.starts_with(".sceStub.text")) text_end_ = std::max(text_end_, s.addr + s.size);
+    // Code the game keeps in writable sections (init routines in .data, called through tables): any PROGBITS
+    // section inside an executable PT_LOAD segment. discover_functions scans them for address-taken functions.
+    for (const auto& s : file.sections()) {
+        if (s.name.starts_with(".text") || s.name.starts_with(".sceStub.text") || s.type != 1 /* PROGBITS */)
+            continue;
+        const auto seg = std::ranges::find_if(module_.segments, [&](const elf::Segment& g) {
+            return g.type == 1 /* PT_LOAD */ && (g.flags & 1) /* PF_X */ && s.addr >= g.vaddr &&
+                   s.addr + s.size <= g.vaddr + g.memsz;
+        });
+        if (seg != module_.segments.end()) code_sections_.push_back({s.addr, s.addr + s.size});
+    }
     for (std::size_t i = 0; i < module_.relocations.size(); ++i) {
         const auto& r = module_.relocations[i];
         reloc_by_addr_.emplace(segment_base(r.offset_segment) + r.offset, i);
@@ -191,7 +203,7 @@ nx::map<std::uint32_t, JumpTable> find_jump_tables(const Program& p) {
             if (i > 0 && starts.contains(at)) break;
             const auto* r = p.relocation_at(at);
             const auto target = p.word(at);
-            if (!r || r->type != prx::kRel32 || !target || !p.in_text(*target)) break;
+            if (!r || r->type != prx::kRel32 || !target || !p.in_code(*target)) break;
             if (c.limit == 0 && (*target + 0x10000 < c.jr || *target > c.jr + 0x10000)) break;  // unbounded: stay local
             jt.targets.push_back(*target);
         }
@@ -203,7 +215,7 @@ nx::map<std::uint32_t, JumpTable> find_jump_tables(const Program& p) {
 nx::vector<Function> discover_functions(const Program& p) {
     nx::map<std::uint32_t, Function> funcs;
     const auto seed = [&](std::uint32_t addr, Function::Origin origin, nx::string name = {}) {
-        if (!p.in_text(addr) || addr % 4) return;
+        if (!p.in_code(addr) || addr % 4) return;
         auto [it, inserted] = funcs.try_emplace(addr, Function{addr, 0, std::move(name), origin});
         if (!inserted && static_cast<int>(origin) < static_cast<int>(it->second.origin)) {
             it->second.origin = origin;
@@ -225,12 +237,21 @@ nx::vector<Function> discover_functions(const Program& p) {
             seed(f.stub, Function::Origin::Import, buf);
         }
 
-    // Direct calls.
-    for (std::uint32_t pc = p.text_begin(); pc < p.text_end(); pc += 4) {
-        const auto in = p.insn(pc);
-        if (in.op == Op::Jal) seed(in.jump_target(), Function::Origin::Call);
-        else if (in.op == Op::Bgezal && in.rs() == 0) seed(in.branch_target(), Function::Origin::Call);
-    }
+    // Direct calls, in .text and the writable code sections alike (.data init routines call .text).
+    // Plain jumps AND branch targets seed too: a branch/jump to an undiscovered function would trap at run
+    // time (the generator only emits intra-function gotos), so every static control-flow edge must land on a
+    // function start. Splits are always safe: entering mid-code with live registers is what the hardware does.
+    const auto seed_calls = [&](std::uint32_t begin, std::uint32_t end) {
+        for (std::uint32_t pc = begin; pc < end; pc += 4) {
+            const auto in = p.insn(pc);
+            if (in.op == Op::Jal) seed(in.jump_target(), Function::Origin::Call);
+            else if (in.op == Op::J) seed(in.jump_target(), Function::Origin::Call);
+            else if (in.op == Op::Bgezal && in.rs() == 0) seed(in.branch_target(), Function::Origin::Call);
+            else if (in.is_branch()) seed(in.branch_target(), Function::Origin::Call);
+        }
+    };
+    seed_calls(p.text_begin(), p.text_end());
+    for (const auto& sec : p.code_sections()) seed_calls(sec.begin, sec.end);
 
     // Code pointers (R32 in data, HI16/LO16 pairs in code). Jump-table entries also point into .text,
     // so a pointer only counts if it looks like a function start.
@@ -262,14 +283,98 @@ nx::vector<Function> discover_functions(const Program& p) {
         if (p.in_text(ptr) && ptr % 4 == 0 && !case_labels.contains(ptr) && looks_like_start(ptr))
             seed(ptr, Function::Origin::Pointer);
 
+    // Function tables in writable code sections (init routines in .data, called through a table): runs of at
+    // least 3 consecutive aligned words pointing into those sections seed every entry. Static tables only
+    // (file-backed words); BSS filled at run time is invisible here.
+    const auto seed_run = [&](std::uint32_t first, std::uint32_t count) {
+        for (std::uint32_t e = first; e < first + count * 4; e += 4)
+            if (const auto t = p.word(e)) seed(*t, Function::Origin::Pointer);
+    };
+    for (const auto& sec : p.code_sections()) {
+        std::uint32_t run = 0;
+        for (std::uint32_t a = sec.begin; a < sec.end; a += 4) {
+            const auto v = p.word(a);
+            if (v && *v % 4 == 0 && p.in_code(*v)) {
+                ++run;
+            } else {
+                if (run >= 3) seed_run(a - run * 4, run);
+                run = 0;
+            }
+        }
+        if (run >= 3) seed_run(sec.end - run * 4, run);
+    }
+
+    // Code addresses handed to the system (thread entries, callbacks, handlers): a constant in a0-a3 at a
+    // jal to an import stub. The stub call itself runs HLE, so the address never appears as a jal target.
+    // No start-shape check: the game would not hand the system a non-entry (and .text holds no data).
+    nx::set<std::uint32_t> stubs;
+    for (const auto& imp : p.module().imports)
+        for (const auto& f : imp.functions) stubs.insert(f.stub);
+    // Register value just before pc, following lui/addiu/ori chains (depth-limited, this function only).
+    const auto constant = [&](auto&& self, std::uint32_t reg, std::uint32_t pc, int depth) -> std::optional<std::uint32_t> {
+        if (reg == 0) return 0u;
+        if (depth > 6) return std::nullopt;
+        for (std::uint32_t q = pc; q >= p.text_begin() + 4 && q + 24 * 4 > pc;) {
+            q -= 4;
+            const auto in = p.insn(q);
+            if (written_gpr(in) != reg) continue;
+            switch (in.op) {
+                case Op::Lui: return in.uimm() << 16;
+                case Op::Addiu:
+                    if (auto v = self(self, in.rs(), q, depth + 1)) return *v + static_cast<std::uint32_t>(in.simm());
+                    return std::nullopt;
+                case Op::Ori:
+                    if (auto v = self(self, in.rs(), q, depth + 1)) return *v | in.uimm();
+                    return std::nullopt;
+                default: return std::nullopt;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto seed_hle_args = [&](std::uint32_t begin, std::uint32_t end) {
+        for (std::uint32_t pc = begin; pc < end; pc += 4) {
+            const auto in = p.insn(pc);
+            if (in.op != Op::Jal || !stubs.contains(in.jump_target())) continue;
+            for (std::uint32_t r = 4; r <= 7; ++r)
+                if (const auto v = constant(constant, r, pc, 0))
+                    if (p.in_code(*v) && *v % 4 == 0 && !case_labels.contains(*v))
+                        seed(*v, Function::Origin::Pointer);
+        }
+    };
+    seed_hle_args(p.text_begin(), p.text_end());
+    for (const auto& sec : p.code_sections()) seed_hle_args(sec.begin, sec.end);
+
+    // Register-indirect calls with a constant target (shared tails, table-driven code reached through a
+    // register): the target never appears as a jal, so seed it. Returns (jalr ra) are excluded. Both .text
+    // and the writable code sections run this scan: the .data init routines dispatch the same way.
+    const auto seed_const_jalr = [&](std::uint32_t begin, std::uint32_t end) {
+        for (std::uint32_t pc = begin; pc < end; pc += 4) {
+            const auto in = p.insn(pc);
+            if (in.op != Op::Jalr || in.rs() == kRa) continue;
+            if (const auto v = constant(constant, in.rs(), pc, 0))
+                if (p.in_code(*v) && *v % 4 == 0) seed(*v, Function::Origin::Pointer);
+        }
+    };
+    seed_const_jalr(p.text_begin(), p.text_end());
+    for (const auto& sec : p.code_sections()) seed_const_jalr(sec.begin, sec.end);
+
     // Gap filling: a function ends after `jr ra` + delay slot when no earlier branch jumps past it and no
-    // computed jump (switch) precedes it; the next non-nop instruction then starts a new function.
+    // computed jump (switch) precedes it; the next non-nop instruction then starts a new function. Runs per
+    // code region (.text and each writable code section); region ends bound the scan like the next start does.
     seed(p.text_begin(), Function::Origin::Gap);
+    for (const auto& sec : p.code_sections()) seed(sec.begin, Function::Origin::Gap);
     // Walked by key: seed() inserts into funcs, which invalidates iterators (nx::map is a B-tree).
     for (auto at = funcs.begin(); at != funcs.end();) {
         const std::uint32_t start = at->first;
         const auto next_it = std::next(at);
-        const std::uint32_t limit = next_it == funcs.end() ? p.text_end() : next_it->first;
+        std::uint32_t limit = next_it == funcs.end() ? p.text_end() : next_it->first;
+        if (next_it == funcs.end()) {
+            for (const auto& s : p.code_sections())
+                if (start >= s.begin && start < s.end) {
+                    limit = s.end;
+                    break;
+                }
+        }
         at = funcs.end();  // not used past this point: the scan below may insert
         std::uint32_t furthest = 0;
         bool computed_jump = false;
@@ -290,8 +395,21 @@ nx::vector<Function> discover_functions(const Program& p) {
 
     nx::vector<Function> out;
     for (auto& [a, f] : funcs) out.push_back(std::move(f));
-    for (std::size_t i = 0; i < out.size(); ++i) out[i].end = i + 1 < out.size() ? out[i + 1].start : p.text_end();
+    finalize_functions(p, out);
     return out;
+}
+
+void finalize_functions(const Program& p, nx::vector<Function>& out) {
+    std::sort(out.begin(), out.end(),
+              [](const Function& a, const Function& b) { return a.start < b.start; });
+    const auto region_end = [&](std::uint32_t addr) {
+        if (p.in_text(addr)) return p.text_end();
+        for (const auto& s : p.code_sections())
+            if (addr >= s.begin && addr < s.end) return s.end;
+        return p.text_end();
+    };
+    for (std::size_t i = 0; i < out.size(); ++i)
+        out[i].end = i + 1 < out.size() ? out[i + 1].start : region_end(out[i].start);
 }
 
 nx::vector<Registration> find_registrations(const Program& p, const nx::vector<Function>& functions) {
@@ -345,7 +463,7 @@ nx::vector<Registration> find_registrations(const Program& p, const nx::vector<F
             if (in.op == Op::Jal && regs[4].known && regs[5].known) {
                 const auto name = p.string_at(address(regs[4]));
                 const auto handler = address(regs[5]);
-                if (!name.empty() && p.in_text(handler))
+                if (!name.empty() && p.in_code(handler))
                     out.push_back(Registration{pc, in.jump_target(), name, handler});
             }
             for (std::uint32_t r : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 24u, 25u, 31u})

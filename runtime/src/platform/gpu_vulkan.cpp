@@ -80,9 +80,8 @@ struct Target {
     std::uint32_t address = 0, stride = 0;
     int format = 3;
     int used_height = 272;  // lines the game has drawn to (scissor extent); textures past it are not ours
-    // Filling the screen: guest pixels added on each side of a display framebuffer, left/right and top/bottom
-    // (guest x, y map to host x + margin_x, y + margin_y), and whether 3D was drawn into it since it was last
-    // shown (else it is shown without the margins).
+    // Filling the screen: guest pixels added on each side (guest x, y map to host x + margin_x, y + margin_y),
+    // and whether 3D was drawn since the target was last shown (else it is shown without the margins).
     int margin_x = 0, margin_y = 0;
     bool filled = false;
     Image color;  // single-sample: what textures, the display and readbacks use
@@ -521,6 +520,9 @@ struct VulkanGeRenderer::Impl {
         end_rendering();
         vkEndCommandBuffer(f.upload);
         vkEndCommandBuffer(f.draw);
+        // VMA_AUTO may select non-coherent memory, notably on Android. Make CPU uploads visible to the GPU.
+        check(vmaFlushAllocation(vk.allocator, f.vertices.memory, 0, VK_WHOLE_SIZE), "flush vertex buffer");
+        check(vmaFlushAllocation(vk.allocator, f.staging.memory, 0, VK_WHOLE_SIZE), "flush staging buffer");
         vkResetFences(vk.device, 1, &f.fence);
         const VkCommandBuffer cmds[2] = {f.upload, f.draw};
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -599,8 +601,9 @@ struct VulkanGeRenderer::Impl {
     Target& target(std::uint32_t address, std::uint32_t stride, int format) {
         address = 0x04000000 | (address & 0x1FFFF0);
         stride = std::clamp<std::uint32_t>(stride, 64, 1024);
-        const bool displayed = display_targets.contains(address);
-        const int margin_x = displayed ? fill_x : 0, margin_y = displayed ? fill_y : 0;
+        // Off-screen passes can share guest depth with a displayed framebuffer. Identical host margins preserve
+        // that sharing (and the depth texel mapping) instead of partitioning depth by presentation shape.
+        const int margin_x = fill_x, margin_y = fill_y;
         auto it = targets.find(address);
         if (it != targets.end() && it->second->stride == stride && it->second->margin_x == margin_x &&
             it->second->margin_y == margin_y) {
@@ -1162,6 +1165,7 @@ struct VulkanGeRenderer::Impl {
     // Filling the screen: sprites reaching an edge of the PSP's screen are stretched over the margins beyond it.
     // 1: each such edge (clears, drawn in strips); 2: only sprites covering the whole screen (solid fills: fades).
     int stretch_edges = 0;
+    bool expand_overlay_x = false, expand_overlay_y = false;
 
     // Drawing-space pixels (already projected) -> Vulkan clip space with w = 1.
     GpuVertex screen_vertex(float x, float y, float z, float s, float t, float q, const float* color, const float* spec, float fog) const {
@@ -1226,6 +1230,17 @@ struct VulkanGeRenderer::Impl {
             screen_xy(c, cx, cy, cz);
             const float area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
             if (cull_mode == 1 ? area < 0.0f : area > 0.0f) return;
+        }
+        if (expand_overlay_x || expand_overlay_y) {
+            for (const ClipVertex* p : {&a, &b, &c}) {
+                float x, y, z;
+                screen_xy(*p, x, y, z);
+                if (expand_overlay_x) x = (x - 240.0f) * (480.0f + 2.0f * margin_x) / 480.0f + 240.0f;
+                if (expand_overlay_y) y = (y - 136.0f) * (272.0f + 2.0f * margin_y) / 272.0f + 136.0f;
+                out.push_back(screen_vertex(x, y, z, p->s / p->q, p->t / p->q, 1, flat ? provoking : p->color,
+                                            p->spec, p->fog));
+            }
+            return;
         }
         // Near-plane clipping (z >= -w), as the software renderer does; the GPU clips the rest.
         ClipVertex in[8] = {a, b, c}, clipped[8];
@@ -1338,6 +1353,41 @@ struct VulkanGeRenderer::Impl {
                 shift_y = static_cast<float>(vertical * t.margin_y);
                 stretch_edges = 0;
             }
+        }
+        // Some fades and dialogs are projected geometry rather than through-mode sprites. Extend only axes that
+        // span the PSP screen: a full-width, partial-height dialog keeps its height and vertical placement. Scene
+        // composites also use direct-color textures; admit those only for a small solid-color overlay texture. Only
+        // expand simple panels: larger projected meshes are positioned artwork and must retain their proportions.
+        bool overlay_texture = !texturing || ts.format() >= 4;
+        if (texturing && ts.format() < 4 && ts.levels() == 1 && ts.width() * ts.height() <= 16) {
+            std::uint32_t pixels[16];
+            ts.decode(0, pixels);
+            overlay_texture = std::all_of(pixels, pixels + ts.width() * ts.height(),
+                                          [first = pixels[0]](std::uint32_t pixel) { return pixel == first; });
+        }
+        expand_overlay_x = expand_overlay_y = margins && !through && !clear && t.filled && clip.size() >= 4 &&
+                                               clip.size() <= 6 && overlay_texture && s.on(ge::ALPHABLENDENABLE) &&
+                                               !s.on(ge::ZTESTENABLE) && s.on(ge::ZWRITEDISABLE);
+        if (expand_overlay_x || expand_overlay_y) {
+            float left = 1e9f, top = 1e9f, right = -1e9f, bottom = -1e9f, plane = 0;
+            for (std::size_t i = 0; i < clip.size(); ++i) {
+                const ClipVertex& c = clip[i];
+                if (c.clip[3] <= 0 || std::abs(c.clip[3] - clip[0].clip[3]) > 0.0001f) {
+                    expand_overlay_x = expand_overlay_y = false;
+                    break;
+                }
+                float x, y, z;
+                screen_xy(c, x, y, z);
+                if (i == 0) plane = z;
+                if (std::abs(z - plane) > 0.01f) {
+                    expand_overlay_x = expand_overlay_y = false;
+                    break;
+                }
+                left = std::min(left, x), right = std::max(right, x);
+                top = std::min(top, y), bottom = std::max(bottom, y);
+            }
+            expand_overlay_x = expand_overlay_x && left <= 0.01f && right >= 479.99f;
+            expand_overlay_y = expand_overlay_y && top <= 0.01f && bottom >= 271.99f;
         }
         if (margins && !through && !clear) t.filled = true;
 

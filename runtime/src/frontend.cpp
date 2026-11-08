@@ -11,6 +11,7 @@
 #include <ctime>
 #include <exception>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -651,13 +652,17 @@ int psprecore::platform::run_game(const GameInfo& game, int argc, char** argv) {
         const elf::File file(boot);
         const auto module = prx::parse(file);
         const auto image = prx::load_image(file, module, kLoadBase);
-        memory.write(kLoadBase, image);
+        // load_image is indexed by absolute address (the recompiler and `psprx image` need that); the guest
+        // only needs the module itself, so the leading zeros below the load base are skipped. Writing the
+        // whole vector at kLoadBase would place every byte 0x08804000 too high and overflow guest RAM.
+        const std::span<const std::byte> body(image.data() + kLoadBase, image.size() - kLoadBase);
+        memory.write(kLoadBase, body);
 
         rt::Kernel kernel(memory);
         rt::set_kernel(&kernel);
         kernel.trace_hle = trace;
         kernel.max_vblanks = max_vblanks;
-        kernel.user_heap().alloc_at(kLoadBase, static_cast<std::uint32_t>(image.size()));
+        kernel.user_heap().alloc_at(kLoadBase, static_cast<std::uint32_t>(body.size()));
         // Recordings are self-contained: --record snapshots the save folder next to the recording (<file>.saves),
         // and --replay runs on a fresh copy of that snapshot (<file>.saves-run), so the game can save freely.
         nx::string saves = saves_dir.empty() ? path_join(data_dir, "saves") : saves_dir;
@@ -1287,9 +1292,9 @@ int psprecore::platform::run_game(const GameInfo& game, int argc, char** argv) {
         }
 
         std::fprintf(stderr, "%s loaded at 0x%08X (%zu bytes), entry 0x%08X\n", module.name.c_str(), kLoadBase,
-                     image.size(), kLoadBase + module.entry);
+                     body.size(), module.entry);
         if (game.loaded) game.loaded();
-        const int code = kernel.run(kLoadBase + module.entry, static_cast<std::uint32_t>(boot_path.size() + 1), args);
+        const int code = kernel.run(module.entry, static_cast<std::uint32_t>(boot_path.size() + 1), args);
         std::fprintf(stderr, "stopped after %.3f s of guest time (%llu vblanks)\n",
                      static_cast<double>(kernel.now()) / 1e6, static_cast<unsigned long long>(kernel.vblank_count()));
         if (profiler) profiler->report(stderr);
