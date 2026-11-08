@@ -240,6 +240,9 @@ void QueryStreamOffset(Context& c) {
     if (!g_mpeg.video)
         std::fprintf(stderr, "sceMpeg: no cooked movie %s (run cccook); showing black\n",
                      cooked::movie_video_path(cooked_root(), key).string().c_str());
+    if (!g_mpeg.audio)
+        std::fprintf(stderr, "sceMpeg: no cooked audio %s (run cccook); silent\n",
+                     cooked::movie_audio_path(cooked_root(), key).string().c_str());
     ret(c, 0);
 }
 
